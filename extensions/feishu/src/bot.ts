@@ -53,9 +53,43 @@ import {
 import { resolveFeishuReasoningPreviewEnabled } from "./reasoning-preview.js";
 import { createFeishuReplyDispatcher } from "./reply-dispatcher.js";
 import { getFeishuRuntime } from "./runtime.js";
-import { getMessageFeishu, listFeishuThreadMessages, sendMessageFeishu } from "./send.js";
-import type { FeishuMessageContext, FeishuMessageInfo } from "./types.js";
+import { getMessageFeishu, listFeishuThreadMessages, sendMessageFeishu, sendCardFeishu } from "./send.js";
+import type { FeishuMessageContext, FeishuMessageInfo, ResolvedFeishuAccount } from "./types.js";
 import type { DynamicAgentCreationConfig } from "./types.js";
+
+// --- /happy imports ---
+import {
+  isHappyMessage,
+  isNewSessionRequest,
+  isResetRequest,
+  stripHappyPrefix,
+  isCommand,
+  extractCommand,
+  extractCommandArgs,
+  isBuiltinCommand,
+  isSuperpowerCommand,
+} from "./target-utils.js";
+import {
+  resolveSuperpowerCommand,
+  getSuperpowerCommandConfig,
+  buildSkillPrompt,
+  getCommandUsageHelp,
+} from "./superpower-commands.js";
+import { HappyClawSDK } from "./sdk/HappyClawSDK.js";
+import type { StreamEvent, PermissionRequest, PermissionResult } from "./sdk/types.js";
+import {
+  sendPermissionCard,
+  waitForPermissionResponse,
+  isApproveAllEnabled,
+  setApproveAllEnabled,
+} from "./permission-handler.js";
+import {
+  sendQuestionCard,
+  handleChatTextAnswer,
+} from "./question-handler.js";
+import { StreamingCardManager } from "./streaming-card-manager.js";
+import { buildHelpCard } from "./card-builder.js";
+import { writeSessionToMemory, extractExecutionDetails, type ClaudeCodeSession, type StreamEventData } from "./memory-bridge.js";
 
 export { toMessageResourceType } from "./bot-content.js";
 
@@ -63,6 +97,34 @@ export { toMessageResourceType } from "./bot-content.js";
 // Key: appId or "default", Value: timestamp of last notification
 const permissionErrorNotifiedAt = new Map<string, number>();
 const PERMISSION_ERROR_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+
+// --- /happy constants and state ---
+const PERMISSION_TIMEOUT_MS = 120_000;
+const DEFAULT_HAPPY_WORKING_DIR = "/tmp/happy_feishu";
+const SESSION_CACHE_TTL_MS = 3_600_000; // 1 hour
+
+/** Per-chatId Claude session cache for multi-turn /happy conversations */
+const cachedClaudeSession = new Map<string, { sessionId: string; expiresAt: number }>();
+/** Concurrency guard: only one /happy execution at a time */
+let activeHappyExecution = false;
+
+function getCachedSessionId(chatId: string): string | undefined {
+  const entry = cachedClaudeSession.get(chatId);
+  if (!entry) return undefined;
+  if (Date.now() > entry.expiresAt) {
+    cachedClaudeSession.delete(chatId);
+    return undefined;
+  }
+  return entry.sessionId;
+}
+
+function setCachedSessionId(chatId: string, sessionId: string): void {
+  cachedClaudeSession.set(chatId, {
+    sessionId,
+    expiresAt: Date.now() + SESSION_CACHE_TTL_MS,
+  });
+}
+
 export type FeishuMessageEvent = {
   sender: {
     sender_id: {
@@ -301,6 +363,635 @@ function filterFetchedGroupContextMessages<
   }).items;
 }
 
+// --- Command handlers for built-in commands ---
+
+interface CommandHandlerContext {
+  cfg: import("openclaw/plugin-sdk/feishu").ClawdbotConfig;
+  account: ResolvedFeishuAccount;
+  chatId: string;
+  senderId: string;
+  senderName?: string;
+  log: (...args: unknown[]) => void;
+}
+
+/**
+ * Handle /help command - Show available commands
+ */
+async function handleHelpCommand(ctx: CommandHandlerContext): Promise<void> {
+  const { cfg, account, chatId } = ctx;
+  const helpCard = JSON.parse(buildHelpCard());
+  await sendCardFeishu({
+    cfg,
+    to: `chat:${chatId}`,
+    card: helpCard,
+    accountId: account.accountId,
+  });
+}
+
+/**
+ * Handle /status command - Show current session info
+ */
+async function handleStatusCommand(ctx: CommandHandlerContext): Promise<void> {
+  const { cfg, account, chatId, senderId, log } = ctx;
+  const cachedSession = getCachedSessionId(chatId);
+  const isRunning = activeHappyExecution;
+
+  const statusLines = [
+    `**User:** \`${senderId}\``,
+    `**Session:** ${cachedSession ? `\`${cachedSession.slice(0, 8)}...\`` : '_None_'}`,
+    `**Running:** ${isRunning ? 'Yes ⏳' : 'No'}`,
+    `**Approve-All:** ${isApproveAllEnabled() ? 'Enabled ✓' : 'Disabled (per-tool approval)'}`,
+  ];
+
+  await sendMessageFeishu({
+    cfg,
+    to: `chat:${chatId}`,
+    text: `📊 **Status**\n\n${statusLines.join('\n')}`,
+    accountId: account.accountId,
+  });
+
+  log(`feishu[${account.accountId}]: /status command executed`);
+}
+
+/**
+ * Handle /stop command - Abort current running task
+ */
+async function handleStopCommand(ctx: CommandHandlerContext): Promise<void> {
+  const { cfg, account, chatId, log } = ctx;
+
+  if (activeHappyExecution) {
+    activeHappyExecution = false;
+    await sendMessageFeishu({
+      cfg,
+      to: `chat:${chatId}`,
+      text: "🛑 **Stopped**\n\nCurrent task has been aborted.",
+      accountId: account.accountId,
+    });
+    log(`feishu[${account.accountId}]: /stop command executed - task aborted`);
+  } else {
+    await sendMessageFeishu({
+      cfg,
+      to: `chat:${chatId}`,
+      text: "ℹ️ **No Running Task**\n\nThere is no task to stop.",
+      accountId: account.accountId,
+    });
+    log(`feishu[${account.accountId}]: /stop command executed - no running task`);
+  }
+}
+
+/**
+ * Handle /reset command - Clear session and approve-all mode
+ */
+async function handleResetCommand(ctx: CommandHandlerContext): Promise<void> {
+  const { cfg, account, chatId, log } = ctx;
+
+  // Clear cached session
+  cachedClaudeSession.delete(chatId);
+
+  // Reset approve-all mode
+  setApproveAllEnabled(false);
+
+  await sendMessageFeishu({
+    cfg,
+    to: `chat:${chatId}`,
+    text: "✅ **Session Reset**\n\nConversation cleared and approve-all mode disabled. Working directory preserved.",
+    accountId: account.accountId,
+  });
+
+  log(`feishu[${account.accountId}]: /reset command executed`);
+}
+
+/**
+ * Main command router - dispatches built-in commands to their handlers
+ * Returns true if command was handled, false otherwise
+ */
+async function handleBuiltinCommand(
+  ctx: CommandHandlerContext,
+  command: string,
+  args: string
+): Promise<boolean> {
+  switch (command) {
+    case '/help':
+      await handleHelpCommand(ctx);
+      return true;
+
+    case '/status':
+      await handleStatusCommand(ctx);
+      return true;
+
+    case '/stop':
+      await handleStopCommand(ctx);
+      return true;
+
+    case '/reset':
+      await handleResetCommand(ctx);
+      return true;
+
+    default:
+      return false;
+  }
+}
+
+// --- /happy command handler ---
+async function handleHappyCommand(params: {
+  cfg: import("openclaw/plugin-sdk/feishu").ClawdbotConfig;
+  account: ResolvedFeishuAccount;
+  chatId: string;
+  prompt: string;
+  newSession: boolean;
+  resetApproveAll: boolean;
+  log: (...args: unknown[]) => void;
+}): Promise<void> {
+  const { cfg, account, chatId, prompt, newSession, resetApproveAll, log } = params;
+
+  if (activeHappyExecution) {
+    await sendMessageFeishu({
+      cfg,
+      to: `chat:${chatId}`,
+      text: "[Happy] Another /happy command is currently running. Please wait.",
+      accountId: account.accountId,
+    });
+    return;
+  }
+
+  if (resetApproveAll) {
+    setApproveAllEnabled(false);
+    log(`feishu[${account.accountId}]: /happy approve-all reset`);
+    if (!prompt) {
+      await sendMessageFeishu({
+        cfg,
+        to: `chat:${chatId}`,
+        text: "[Happy] Approve-all mode has been reset. Future tool use will require individual approval.",
+        accountId: account.accountId,
+      });
+      return;
+    }
+  }
+
+  if (newSession) {
+    cachedClaudeSession.delete(chatId);
+    log(`feishu[${account.accountId}]: /happy new session requested`);
+  }
+
+  if (!prompt) {
+    await sendMessageFeishu({
+      cfg,
+      to: `chat:${chatId}`,
+      text: "[Happy] Please provide a prompt after /happy. Example: /happy what files are in this directory?",
+      accountId: account.accountId,
+    });
+    return;
+  }
+
+  activeHappyExecution = true;
+
+  // Create card manager
+  const cardManager = new StreamingCardManager(cfg, account.accountId);
+
+  // Determine working directory (needed for session data)
+  const feishuCfg = account.config as Record<string, unknown> | undefined;
+  const workingDirectory = (feishuCfg?.happyWorkingDirectory as string) || DEFAULT_HAPPY_WORKING_DIR;
+
+  // Track stream events for memory bridge analysis
+  const streamEvents: StreamEventData[] = [];
+
+  // Prepare session data for memory bridge (written in finally block)
+  let sessionData: ClaudeCodeSession = {
+    userId: account.accountId,
+    chatId: chatId,
+    task: prompt.substring(0, 200),
+    actions: [`Executed /happy command in ${workingDirectory}`],
+    toolsUsed: [],
+    filesModified: [],
+    result: 'failure',
+    insights: [],
+    fullContext: `Prompt: ${prompt}`,
+    error: undefined,
+  };
+
+  try {
+    // Start streaming card session
+    await cardManager.startSession(chatId);
+
+    // Create permission callback
+    const onPermission = async (request: PermissionRequest): Promise<PermissionResult> => {
+      if (isApproveAllEnabled()) {
+        log(`feishu[${account.accountId}]: /happy auto-approved tool: ${request.toolName}`);
+        return { approved: true };
+      }
+
+      await sendPermissionCard({
+        account,
+        chatId,
+        permissionId: request.permissionId,
+        toolName: request.toolName,
+        toolInput: request.toolInput,
+      });
+
+      return waitForPermissionResponse(request.permissionId, PERMISSION_TIMEOUT_MS);
+    };
+
+    // Create stream event handler that delegates to card manager AND collects events for memory
+    const onStreamEvent = (event: StreamEvent): void => {
+      // Collect event for memory bridge analysis
+      streamEvents.push({
+        type: event.type,
+        data: event.data,
+        timestamp: event.timestamp || Date.now(),
+      });
+      // Delegate to card manager for UI updates
+      cardManager.handleEvent(chatId, event);
+    };
+
+    // Create question callback for AskUserQuestion
+    const onAskUserQuestion = async (request: import('./sdk/types.js').QuestionRequest): Promise<import('./sdk/types.js').QuestionResult> => {
+      log(`feishu[${account.accountId}]: /happy AskUserQuestion called with ${request.questions.length} question(s)`);
+
+      // Send the question card and wait for the answer
+      const { questionId, answerPromise } = await sendQuestionCard(
+        { questionId: 'pending', questions: request.questions },
+        PERMISSION_TIMEOUT_MS,
+        chatId // Pass chatId for text answer routing
+      );
+
+      log(`feishu[${account.accountId}]: /happy waiting for question answer (ID: ${questionId})`);
+
+      // Wait for the user's response
+      const answer = await answerPromise;
+
+      log(`feishu[${account.accountId}]: /happy question answered: ${answer.answered}`);
+
+      return answer;
+    };
+
+    // Get cached session ID
+    const claudeSessionId = getCachedSessionId(chatId);
+    if (claudeSessionId) {
+      log(`feishu[${account.accountId}]: /happy resuming session ${claudeSessionId}`);
+    }
+
+    // Execute via HappyClawSDK
+    const sdk = new HappyClawSDK({
+      workingDirectory,
+      permissionMode: "default",
+      onPermission,
+      onStreamEvent,
+      onAskUserQuestion,
+    });
+
+    const constrainedPrompt = `Work exclusively within ${workingDirectory}. ${prompt}`;
+    const result = await sdk.execute(constrainedPrompt, { claudeSessionId });
+
+    // Cache session for future turns
+    if (result.claudeSessionId) {
+      setCachedSessionId(chatId, result.claudeSessionId);
+    }
+
+    // End card session (triggers final update)
+    await cardManager.endSession(chatId);
+
+    log(`feishu[${account.accountId}]: /happy command completed (success=${result.success})`);
+
+    // Extract execution details from stream events
+    const executionDetails = extractExecutionDetails(streamEvents);
+
+    // Build insights from execution details
+    const insights: string[] = [
+      result.success ? 'Command completed successfully' : 'Command encountered errors',
+      `Working directory: ${workingDirectory}`,
+    ];
+    if (executionDetails.toolsUsed.length > 0) {
+      insights.push(`Tools used: ${executionDetails.toolsUsed.join(', ')}`);
+    }
+    if (executionDetails.filesModified.length > 0) {
+      insights.push(`Modified ${executionDetails.filesModified.length} file(s)`);
+    }
+    if (executionDetails.commandsExecuted.length > 0) {
+      insights.push(`Executed ${executionDetails.commandsExecuted.length} command(s)`);
+    }
+
+    // Build full context with execution details
+    let fullContext = `Prompt: ${prompt}\n\n`;
+    if (executionDetails.toolsUsed.length > 0) {
+      fullContext += `Tools Used: ${executionDetails.toolsUsed.join(', ')}\n`;
+    }
+    if (executionDetails.filesModified.length > 0) {
+      fullContext += `Files Modified:\n${executionDetails.filesModified.map(f => `  - ${f}`).join('\n')}\n`;
+    }
+    if (executionDetails.commandsExecuted.length > 0) {
+      fullContext += `Commands Executed:\n${executionDetails.commandsExecuted.map(c => `  - ${c}`).join('\n')}\n`;
+    }
+    fullContext += `\nResult: ${result.success ? 'Success' : result.error || 'Failed'}`;
+
+    // Update session data with extracted execution details
+    sessionData = {
+      ...sessionData,
+      actions: executionDetails.actions.length > 0 ? executionDetails.actions : sessionData.actions,
+      toolsUsed: executionDetails.toolsUsed,
+      filesModified: executionDetails.filesModified,
+      result: result.success ? 'success' : 'failure',
+      insights,
+      fullContext,
+      error: result.error,
+    };
+  } catch (err) {
+    log(`feishu[${account.accountId}]: /happy command failed: ${String(err)}`);
+
+    // Update session data with error
+    sessionData = {
+      ...sessionData,
+      result: 'failure',
+      insights: ['Command failed with error'],
+      fullContext: `Prompt: ${prompt}\n\nError: ${String(err)}`,
+      error: String(err),
+    };
+
+    // Update card with error
+    const errorManager = new StreamingCardManager(cfg, account.accountId);
+    try {
+      await errorManager.startSession(chatId);
+      errorManager.handleEvent(chatId, {
+        type: 'status',
+        data: 'error',
+        timestamp: Date.now(),
+      });
+      await errorManager.endSession(chatId);
+    } catch {
+      // Fallback to text message
+      await sendMessageFeishu({
+        cfg,
+        to: `chat:${chatId}`,
+        text: `[Happy] Error: ${String(err)}`,
+        accountId: account.accountId,
+      });
+    } finally {
+      errorManager.destroy();
+    }
+  } finally {
+    // Write session to OpenClaw memory (async, non-blocking)
+    // This runs for both success and error cases
+    writeSessionToMemory(sessionData).catch((err) => {
+      console.error(`[MemoryBridge] Failed to write session: ${err}`);
+    });
+
+    cardManager.destroy();
+    activeHappyExecution = false;
+  }
+}
+
+// --- Superpower command handler ---
+async function handleSuperpowerCommand(params: {
+  cfg: import("openclaw/plugin-sdk/feishu").ClawdbotConfig;
+  account: ResolvedFeishuAccount;
+  chatId: string;
+  command: string;
+  args: string;
+  log: (...args: unknown[]) => void;
+}): Promise<void> {
+  const { cfg, account, chatId, command, args, log } = params;
+
+  // Resolve the command (handles aliases)
+  const baseCommand = resolveSuperpowerCommand(command);
+  if (!baseCommand) {
+    await sendMessageFeishu({
+      cfg,
+      to: `chat:${chatId}`,
+      text: `[Superpowers] Unknown command: ${command}`,
+      accountId: account.accountId,
+    });
+    return;
+  }
+
+  const config = getSuperpowerCommandConfig(command);
+  if (!config) {
+    await sendMessageFeishu({
+      cfg,
+      to: `chat:${chatId}`,
+      text: `[Superpowers] Command not configured: ${command}`,
+      accountId: account.accountId,
+    });
+    return;
+  }
+
+  // Validate arguments
+  if (config.requiresArgs && !args.trim()) {
+    await sendMessageFeishu({
+      cfg,
+      to: `chat:${chatId}`,
+      text: `[Superpowers] ${getCommandUsageHelp(command)}`,
+      accountId: account.accountId,
+    });
+    return;
+  }
+
+  // Check if another execution is running
+  if (activeHappyExecution) {
+    await sendMessageFeishu({
+      cfg,
+      to: `chat:${chatId}`,
+      text: "[Superpowers] Another command is currently running. Please wait.",
+      accountId: account.accountId,
+    });
+    return;
+  }
+
+  activeHappyExecution = true;
+
+  // Create card manager
+  const cardManager = new StreamingCardManager(cfg, account.accountId);
+
+  // Determine working directory (needed for session data)
+  const feishuCfg = account.config as Record<string, unknown> | undefined;
+  const workingDirectory = (feishuCfg?.happyWorkingDirectory as string) || DEFAULT_HAPPY_WORKING_DIR;
+
+  // Track stream events for memory bridge analysis
+  const streamEvents: StreamEventData[] = [];
+
+  // Prepare session data for memory bridge (written in finally block)
+  let sessionData: ClaudeCodeSession = {
+    userId: account.accountId,
+    chatId: chatId,
+    task: `/${baseCommand} ${args}`,
+    actions: [`Executed superpower command: /${baseCommand}`],
+    toolsUsed: [],
+    filesModified: [],
+    result: 'failure',
+    insights: [`Skill: ${config.skill}`],
+    fullContext: `Command: /${baseCommand} ${args}\nSkill: ${config.skill}`,
+    error: undefined,
+  };
+
+  try {
+    // Start streaming card session
+    await cardManager.startSession(chatId);
+
+    // Create permission callback
+    const onPermission = async (request: PermissionRequest): Promise<PermissionResult> => {
+      if (isApproveAllEnabled()) {
+        log(`feishu[${account.accountId}]: /${baseCommand} auto-approved tool: ${request.toolName}`);
+        return { approved: true };
+      }
+
+      await sendPermissionCard({
+        account,
+        chatId,
+        permissionId: request.permissionId,
+        toolName: request.toolName,
+        toolInput: request.toolInput,
+      });
+
+      return waitForPermissionResponse(request.permissionId, PERMISSION_TIMEOUT_MS);
+    };
+
+    // Create stream event handler that delegates to card manager AND collects events for memory
+    const onStreamEvent = (event: StreamEvent): void => {
+      // Collect event for memory bridge analysis
+      streamEvents.push({
+        type: event.type,
+        data: event.data,
+        timestamp: event.timestamp || Date.now(),
+      });
+      // Delegate to card manager for UI updates
+      cardManager.handleEvent(chatId, event);
+    };
+
+    // Create question callback for AskUserQuestion
+    const onAskUserQuestion = async (request: import('./sdk/types.js').QuestionRequest): Promise<import('./sdk/types.js').QuestionResult> => {
+      log(`feishu[${account.accountId}]: /${baseCommand} AskUserQuestion called with ${request.questions.length} question(s)`);
+
+      const { questionId, answerPromise } = await sendQuestionCard(
+        { questionId: 'pending', questions: request.questions },
+        PERMISSION_TIMEOUT_MS,
+        chatId
+      );
+
+      log(`feishu[${account.accountId}]: /${baseCommand} waiting for question answer (ID: ${questionId})`);
+
+      const answer = await answerPromise;
+
+      log(`feishu[${account.accountId}]: /${baseCommand} question answered: ${answer.answered}`);
+
+      return answer;
+    };
+
+    // Get cached session ID for context continuity
+    const claudeSessionId = getCachedSessionId(chatId);
+    if (claudeSessionId) {
+      log(`feishu[${account.accountId}]: /${baseCommand} resuming session ${claudeSessionId}`);
+    }
+
+    // Execute via HappyClawSDK with skill invocation
+    const sdk = new HappyClawSDK({
+      workingDirectory,
+      permissionMode: "default",
+      onPermission,
+      onStreamEvent,
+      onAskUserQuestion,
+    });
+
+    // Build the skill invocation prompt
+    const skillPrompt = buildSkillPrompt(config.skill, args);
+    const constrainedPrompt = `Work exclusively within ${workingDirectory}. ${skillPrompt}`;
+    const result = await sdk.execute(constrainedPrompt, { claudeSessionId });
+
+    // Cache session for future turns
+    if (result.claudeSessionId) {
+      setCachedSessionId(chatId, result.claudeSessionId);
+    }
+
+    // End card session (triggers final update)
+    await cardManager.endSession(chatId);
+
+    log(`feishu[${account.accountId}]: /${baseCommand} command completed (success=${result.success})`);
+
+    // Extract execution details from stream events
+    const executionDetails = extractExecutionDetails(streamEvents);
+
+    // Build insights from execution details
+    const insights: string[] = [
+      `Skill: ${config.skill}`,
+      result.success ? 'Command completed successfully' : 'Command encountered errors',
+    ];
+    if (executionDetails.toolsUsed.length > 0) {
+      insights.push(`Tools used: ${executionDetails.toolsUsed.join(', ')}`);
+    }
+    if (executionDetails.filesModified.length > 0) {
+      insights.push(`Modified ${executionDetails.filesModified.length} file(s)`);
+    }
+    if (executionDetails.commandsExecuted.length > 0) {
+      insights.push(`Executed ${executionDetails.commandsExecuted.length} command(s)`);
+    }
+
+    // Build full context with execution details
+    let fullContext = `Command: /${baseCommand} ${args}\nSkill: ${config.skill}\n`;
+    if (executionDetails.toolsUsed.length > 0) {
+      fullContext += `Tools Used: ${executionDetails.toolsUsed.join(', ')}\n`;
+    }
+    if (executionDetails.filesModified.length > 0) {
+      fullContext += `Files Modified:\n${executionDetails.filesModified.map(f => `  - ${f}`).join('\n')}\n`;
+    }
+    if (executionDetails.commandsExecuted.length > 0) {
+      fullContext += `Commands Executed:\n${executionDetails.commandsExecuted.map(c => `  - ${c}`).join('\n')}\n`;
+    }
+    fullContext += `\nResult: ${result.success ? 'Success' : result.error || 'Failed'}`;
+
+    // Update session data with extracted execution details
+    sessionData = {
+      ...sessionData,
+      actions: executionDetails.actions.length > 0 ? executionDetails.actions : sessionData.actions,
+      toolsUsed: executionDetails.toolsUsed,
+      filesModified: executionDetails.filesModified,
+      result: result.success ? 'success' : 'failure',
+      insights,
+      fullContext,
+      error: result.error,
+    };
+  } catch (err) {
+    log(`feishu[${account.accountId}]: /${baseCommand} command failed: ${String(err)}`);
+
+    // Update session data with error
+    sessionData = {
+      ...sessionData,
+      result: 'failure',
+      insights: [`Skill: ${config.skill}`, 'Command failed with error'],
+      fullContext: `Command: /${baseCommand} ${args}\nSkill: ${config.skill}\n\nError: ${String(err)}`,
+      error: String(err),
+    };
+
+    // Update card with error
+    const errorManager = new StreamingCardManager(cfg, account.accountId);
+    try {
+      await errorManager.startSession(chatId);
+      errorManager.handleEvent(chatId, {
+        type: 'status',
+        data: 'error',
+        timestamp: Date.now(),
+      });
+      await errorManager.endSession(chatId);
+    } catch {
+      // Fallback to text message
+      await sendMessageFeishu({
+        cfg,
+        to: `chat:${chatId}`,
+        text: `[Superpowers] Error: ${String(err)}`,
+        accountId: account.accountId,
+      });
+    } finally {
+      errorManager.destroy();
+    }
+  } finally {
+    // Write session to OpenClaw memory (async, non-blocking)
+    // This runs for both success and error cases
+    writeSessionToMemory(sessionData).catch((err) => {
+      console.error(`[MemoryBridge] Failed to write session: ${err}`);
+    });
+
+    cardManager.destroy();
+    activeHappyExecution = false;
+  }
+}
+}
+
 export async function handleFeishuMessage(params: {
   cfg: ClawdbotConfig;
   event: FeishuMessageEvent;
@@ -536,6 +1227,76 @@ export async function handleFeishuMessage(params: {
       return;
     }
   } else {
+  }
+
+  // --- Check for active question (text answer routing) ---
+  // Before processing commands, check if there's an active question waiting for text input
+  if (ctx.content.trim()) {
+    const handled = handleChatTextAnswer(ctx.chatId, ctx.content.trim());
+    if (handled) {
+      log(`feishu[${account.accountId}]: text answer routed to active question for chat ${ctx.chatId}`);
+      return; // Don't process as command or regular message
+    }
+  }
+
+  // --- Command detection (built-in commands and /happy) ---
+  if (isCommand(ctx.content)) {
+    const command = extractCommand(ctx.content);
+    const args = extractCommandArgs(ctx.content);
+
+    // Handle built-in commands (/help, /status, /stop, /reset)
+    if (isBuiltinCommand(ctx.content) && command !== '/happy' && command !== '/happy-claude-code') {
+      log(`feishu[${account.accountId}]: built-in command detected: ${command}`);
+      const handled = await handleBuiltinCommand(
+        {
+          cfg,
+          account,
+          chatId: ctx.chatId,
+          senderId: ctx.senderOpenId,
+          senderName: ctx.senderName,
+          log,
+        },
+        command,
+        args
+      );
+
+      if (handled) {
+        return;
+      }
+      // If not handled by our built-in commands, fall through to OpenClaw command handling
+    }
+
+    // Handle superpower commands (/brain, /plan, /do and aliases /b, /p, /d)
+    if (isSuperpowerCommand(ctx.content)) {
+      log(`feishu[${account.accountId}]: superpower command detected: ${command}`);
+      await handleSuperpowerCommand({
+        cfg,
+        account,
+        chatId: ctx.chatId,
+        command,
+        args,
+        log,
+      });
+      return;
+    }
+
+    // Handle /happy command
+    if (isHappyMessage(ctx.content)) {
+      const newSession = isNewSessionRequest(ctx.content);
+      const resetApproveAll = isResetRequest(ctx.content);
+      const prompt = stripHappyPrefix(ctx.content);
+      log(`feishu[${account.accountId}]: /happy command detected (newSession=${newSession}, reset=${resetApproveAll})`);
+      await handleHappyCommand({
+        cfg,
+        account,
+        chatId: ctx.chatId,
+        prompt,
+        newSession,
+        resetApproveAll,
+        log,
+      });
+      return;
+    }
   }
 
   try {

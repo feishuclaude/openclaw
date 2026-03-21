@@ -226,6 +226,8 @@ export const FeishuConfigSchema = z
     topicSessionMode: TopicSessionModeSchema,
     // Dynamic agent creation for DM users
     dynamicAgentCreation: DynamicAgentCreationSchema,
+    // Working directory for @happy (Claude Agent SDK) commands
+    happyWorkingDirectory: z.string().optional(),
     // Optimization flags
     typingIndicator: z.boolean().optional().default(true),
     resolveSenderNames: z.boolean().optional().default(true),
