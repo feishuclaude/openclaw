@@ -1,5 +1,7 @@
 // feishu/src/target-utils.ts
 
+import { isRegisteredCommand } from "./command-registry.js";
+
 /**
  * Check if a message text is a command (starts with /)
  */
@@ -73,6 +75,8 @@ export const BUILTIN_COMMANDS = new Set([
   "/status",
   "/stop",
   "/reset",
+  "/approve",
+  "/deny",
   "/happy",
   "/happy-claude-code",
 ]);
@@ -86,11 +90,23 @@ export function isBuiltinCommand(messageText: string): boolean {
 }
 
 /**
- * Check if a message is a superpower command (e.g., /brain, /plan, /do, /b, /p, /d)
+ * Check if a message is a superpower/skill command (e.g., /brain, /plan, /do, /b, /p, /d)
  */
 export function isSuperpowerCommand(messageText: string): boolean {
   const cmd = extractCommand(messageText);
   if (!cmd) return false;
-  const { isSuperpowerCommandName } = require("./superpower-commands");
-  return isSuperpowerCommandName(cmd);
+  return isRegisteredCommand(cmd);
+}
+
+/**
+ * Permission commands for text-based approve/deny
+ */
+const PERMISSION_COMMANDS = new Set(["/approve", "/deny"]);
+
+/**
+ * Check if a message is a permission command (/approve or /deny)
+ */
+export function isPermissionCommand(messageText: string): boolean {
+  const cmd = extractCommand(messageText);
+  return PERMISSION_COMMANDS.has(cmd);
 }

@@ -20,6 +20,9 @@ const pendingPermissions = new Map<
   }
 >();
 
+// Chat-scoped reverse lookup: chatId -> most recent pending permissionId
+const pendingPermissionByChat = new Map<string, string>();
+
 // Approve-all state: when enabled, all future permission requests auto-approve
 let approveAllEnabled = false;
 
@@ -128,12 +131,18 @@ export async function sendPermissionCard(opts: {
 }
 
 /**
- * Wait for permission response from card button click.
+ * Wait for permission response from card button click or /approve / /deny command.
  */
 export async function waitForPermissionResponse(
   permissionId: string,
   timeout: number,
+  chatId?: string,
 ): Promise<PermissionResult> {
+  // Track the latest pending permission for this chat (enables /approve and /deny)
+  if (chatId) {
+    pendingPermissionByChat.set(chatId, permissionId);
+  }
+
   return new Promise((resolve) => {
     const expiresAt = Date.now() + timeout;
     const timer = setTimeout(() => {
@@ -147,6 +156,10 @@ export async function waitForPermissionResponse(
     function cleanup() {
       clearTimeout(timer);
       pendingPermissions.delete(permissionId);
+      // Only remove the chat mapping if it still points to this permission
+      if (chatId && pendingPermissionByChat.get(chatId) === permissionId) {
+        pendingPermissionByChat.delete(chatId);
+      }
     }
 
     pendingPermissions.set(permissionId, {
@@ -158,6 +171,22 @@ export async function waitForPermissionResponse(
       expiresAt,
     });
   });
+}
+
+/**
+ * Get the most recent pending permission ID for a chat.
+ * Used by /approve and /deny text commands to resolve the correct permission.
+ * @returns The pending permissionId, or null if none exists
+ */
+export function resolveLatestPendingPermission(chatId: string): string | null {
+  const permissionId = pendingPermissionByChat.get(chatId);
+  if (!permissionId) return null;
+  // Verify the permission is still pending
+  if (!pendingPermissions.has(permissionId)) {
+    pendingPermissionByChat.delete(chatId);
+    return null;
+  }
+  return permissionId;
 }
 
 /**

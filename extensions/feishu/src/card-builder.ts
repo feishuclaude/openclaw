@@ -3,6 +3,7 @@
  * Ported from metabot with minor adaptations for OpenClaw architecture
  */
 
+import { getAllCommands } from "./command-registry.js";
 import type { CardState, CardStatus } from "./streaming-card-types.js";
 
 /** Status configuration: color, title, icon */
@@ -220,9 +221,15 @@ export function buildCard(state: CardState): string {
 }
 
 /**
- * Build a help card with command reference
+ * Build a help card with command reference.
+ * Skill commands are generated dynamically from the command registry.
  */
 export function buildHelpCard(): string {
+  const commands = getAllCommands();
+  const skillLines = commands.map(
+    (cmd) => `\`/${cmd.name}\` \`/${cmd.alias}\` - ${cmd.description}`,
+  );
+
   const card = {
     config: { wide_screen_mode: true },
     header: {
@@ -240,11 +247,15 @@ export function buildHelpCard(): string {
           "`/happy <prompt>` - Execute Claude Code with streaming output",
           "`/happy --new` - Start a new session",
           "`/happy --reset` - Reset approve-all mode",
+          "`/happy on` - Start persistent session (no prefix needed)",
+          "`/happy off` - End persistent session",
           "",
-          "**Superpowers:**",
-          "`/brain <topic>` `/b` - Brainstorm ideas",
-          "`/plan <task>` `/p` - Create implementation plan",
-          "`/do <plan>` `/d` - Execute a plan",
+          "**Skills:**",
+          ...skillLines,
+          "",
+          "**Permissions:**",
+          "`/approve` - Approve pending tool use",
+          "`/deny` - Deny pending tool use",
           "",
           "**Session:**",
           "`/status` - Show current session info",
@@ -254,6 +265,7 @@ export function buildHelpCard(): string {
           "",
           "**Usage:**",
           "Use `/happy <prompt>` to start a conversation with Claude Code.",
+          "Use `/happy on` to enter persistent mode (messages route directly).",
           "Each chat has an independent session with a fixed working directory.",
         ].join("\n"),
       },

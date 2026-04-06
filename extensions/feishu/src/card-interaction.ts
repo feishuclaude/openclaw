@@ -148,14 +148,12 @@ export function decodeFeishuCardAction(params: {
       return { kind: "invalid", reason: "stale" };
     }
 
-    const expectedUser =
-      typeof actionValue.c.u === "string" ? actionValue.c.u.trim() : undefined;
+    const expectedUser = typeof actionValue.c.u === "string" ? actionValue.c.u.trim() : undefined;
     if (expectedUser && expectedUser !== (event.operator.open_id ?? "").trim()) {
       return { kind: "invalid", reason: "wrong_user" };
     }
 
-    const expectedChat =
-      typeof actionValue.c.h === "string" ? actionValue.c.h.trim() : undefined;
+    const expectedChat = typeof actionValue.c.h === "string" ? actionValue.c.h.trim() : undefined;
     if (expectedChat && expectedChat !== (event.context.chat_id ?? "").trim()) {
       return { kind: "invalid", reason: "wrong_conversation" };
     }
