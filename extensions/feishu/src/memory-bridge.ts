@@ -12,7 +12,7 @@
  * - Key insights → OpenClaw agent notification (~200 tokens)
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { writeFile, mkdir } from "node:fs/promises";
@@ -44,6 +44,8 @@ export interface ClaudeCodeSession {
   duration?: number;
   /** Error message when failed */
   error?: string;
+  /** Cross-layer request tracing ID */
+  requestId?: string;
 }
 
 /**
@@ -53,6 +55,105 @@ export interface MemoryWriteResult {
   success: boolean;
   filepath?: string;
   error?: string;
+}
+
+/** Cached CLI availability result: null = unchecked, boolean = checked */
+let openclawAvailable: boolean | null = null;
+
+/** Log prefix for consistent structured logging */
+const LOG_PREFIX = "[feishu:memory-bridge]";
+
+/**
+ * Check whether the `openclaw` CLI is available in PATH.
+ *
+ * The result is cached after the first probe so subsequent calls are free.
+ * We spawn `openclaw --version` with a short timeout; ENOENT or any error
+ * means the binary is not reachable.
+ */
+async function checkOpenClawAvailable(): Promise<boolean> {
+  if (openclawAvailable !== null) {
+    return openclawAvailable;
+  }
+
+  return new Promise<boolean>((resolve) => {
+    const proc = spawn("openclaw", ["--version"], { stdio: "ignore" });
+
+    const timer = setTimeout(() => {
+      proc.kill();
+      openclawAvailable = false;
+      console.warn(
+        `${LOG_PREFIX} openclaw CLI not found in PATH — memory bridge auto-index and notifications disabled`,
+      );
+      resolve(false);
+    }, 5_000);
+
+    proc.on("error", () => {
+      clearTimeout(timer);
+      openclawAvailable = false;
+      console.warn(
+        `${LOG_PREFIX} openclaw CLI not found in PATH — memory bridge auto-index and notifications disabled`,
+      );
+      resolve(false);
+    });
+
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      openclawAvailable = code === 0;
+      if (!openclawAvailable) {
+        console.warn(
+          `${LOG_PREFIX} openclaw CLI exited with code ${code} — memory bridge auto-index and notifications disabled`,
+        );
+      }
+      resolve(openclawAvailable);
+    });
+  });
+}
+
+/**
+ * Check whether the memory bridge is disabled via environment variable.
+ *
+ * Set `FEISHU_MEMORY_BRIDGE_ENABLED=false` or `FEISHU_MEMORY_BRIDGE_ENABLED=0`
+ * to disable all memory bridge operations.
+ */
+function isBridgeDisabledByEnv(): boolean {
+  const val = process.env.FEISHU_MEMORY_BRIDGE_ENABLED;
+  return val === "false" || val === "0";
+}
+
+/**
+ * Spawn a child process with automatic retry on transient failures.
+ *
+ * ENOENT errors (binary not found) are never retried. Other errors
+ * are retried up to `retries` times with a 2-second delay between attempts.
+ */
+async function spawnWithRetry(
+  command: string,
+  args: string[],
+  options: SpawnOptions,
+  retries = 1,
+): Promise<ChildProcess> {
+  return new Promise<ChildProcess>((resolve, reject) => {
+    function attempt(remaining: number): void {
+      const proc = spawn(command, args, options);
+
+      proc.on("error", (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT" || remaining <= 0) {
+          reject(err);
+          return;
+        }
+        console.warn(
+          `${LOG_PREFIX} spawn failed (${err.message}), retrying in 2s (${remaining} left)`,
+        );
+        setTimeout(() => attempt(remaining - 1), 2_000);
+      });
+
+      proc.on("spawn", () => {
+        resolve(proc);
+      });
+    }
+
+    attempt(retries);
+  });
 }
 
 /**
@@ -89,15 +190,22 @@ export class OpenClawMemoryBridge {
     this.memoryDir = memoryDir ?? getMemoryDir();
     this.autoIndex = options?.autoIndex ?? true; // Auto-index enabled by default
     this.autoNotify = options?.autoNotify ?? true; // Auto-notify enabled by default
+
+    if (isBridgeDisabledByEnv()) {
+      this.enabled = false;
+      console.warn(`${LOG_PREFIX} disabled via FEISHU_MEMORY_BRIDGE_ENABLED env var`);
+      return;
+    }
+
     this.enabled = existsSync(this.memoryDir);
 
     if (!this.enabled) {
-      console.warn(`[MemoryBridge] OpenClaw memory directory does not exist: ${this.memoryDir}`);
-      console.warn("[MemoryBridge] Memory bridge is disabled, will not write files.");
+      console.warn(`${LOG_PREFIX} OpenClaw memory directory does not exist: ${this.memoryDir}`);
+      console.warn(`${LOG_PREFIX} Memory bridge is disabled, will not write files.`);
     } else {
-      console.log(`[MemoryBridge] Initialization complete, directory: ${this.memoryDir}`);
-      console.log(`[MemoryBridge] Auto-index: ${this.autoIndex ? "enabled" : "disabled"}`);
-      console.log(`[MemoryBridge] Auto-notify: ${this.autoNotify ? "enabled" : "disabled"}`);
+      console.log(`${LOG_PREFIX} Initialization complete, directory: ${this.memoryDir}`);
+      console.log(`${LOG_PREFIX} Auto-index: ${this.autoIndex ? "enabled" : "disabled"}`);
+      console.log(`${LOG_PREFIX} Auto-notify: ${this.autoNotify ? "enabled" : "disabled"}`);
     }
   }
 
@@ -126,13 +234,13 @@ export class OpenClawMemoryBridge {
       const sessionId = randomUUID();
       const timestamp = new Date();
       const dateStr = timestamp.toISOString().split("T")[0]; // YYYY-MM-DD
-      const timeStr = timestamp.toTimeString().split(" ")[0]; // HH:MM:SS
+      const _timeStr = timestamp.toTimeString().split(" ")[0]; // HH:MM:SS
 
       // Create filename: YYYY-MM-DD-claude-code-{task-abbrev}-{session-id-8-chars}.md
       // Sanitize task: remove path separators and special chars, limit to 20 chars
       const taskAbbrev = session.task
         .substring(0, 20)
-        .replace(/[\/\\:*?"<>|]/g, "-") // Replace path-unsafe chars
+        .replace(/[/\\:*?"<>|]/g, "-") // Replace path-unsafe chars
         .replace(/\s+/g, "-") // Replace spaces
         .toLowerCase();
       const sessionIdShort = sessionId.substring(0, 8);
@@ -148,9 +256,12 @@ export class OpenClawMemoryBridge {
       // Write file
       await writeFile(filepath, content, "utf-8");
 
-      console.log(`[MemoryBridge] ✅ Session written: ${filepath}`);
-      console.log(`[MemoryBridge] 📝 Task: ${session.task}`);
-      console.log(`[MemoryBridge] 👤 User: ${session.userId}`);
+      console.log(`${LOG_PREFIX} Session written: ${filepath}`);
+      console.log(`${LOG_PREFIX} Task: ${session.task}`);
+      console.log(`${LOG_PREFIX} User: ${session.userId}`);
+      if (session.requestId) {
+        console.log(`${LOG_PREFIX} Request ID: ${session.requestId}`);
+      }
 
       const result: MemoryWriteResult = {
         success: true,
@@ -162,11 +273,11 @@ export class OpenClawMemoryBridge {
         this.reindexMemory()
           .then((indexed) => {
             if (indexed) {
-              console.log(`[MemoryBridge] 🔄 Memory reindex complete`);
+              console.log(`${LOG_PREFIX} Memory reindex complete`);
             }
           })
           .catch((err) => {
-            console.error(`[MemoryBridge] ⚠️ Reindex failed: ${err}`);
+            console.error(`${LOG_PREFIX} Reindex failed:`, err);
           });
       }
 
@@ -175,18 +286,18 @@ export class OpenClawMemoryBridge {
         this.notifyAgent(filepath, session.insights)
           .then((notified) => {
             if (notified) {
-              console.log(`[MemoryBridge] 📢 Agent notification sent`);
+              console.log(`${LOG_PREFIX} Agent notification sent`);
             }
           })
           .catch((err) => {
-            console.error(`[MemoryBridge] ⚠️ Agent notification failed: ${err}`);
+            console.error(`${LOG_PREFIX} Agent notification failed:`, err);
           });
       }
 
       return result;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      console.error(`[MemoryBridge] ❌ Failed to write session: ${errorMsg}`);
+      console.error(`${LOG_PREFIX} Failed to write session: ${errorMsg}`);
       return {
         success: false,
         error: errorMsg,
@@ -213,6 +324,7 @@ export class OpenClawMemoryBridge {
 - **Source**: claude-code-plugin
 - **User**: ${session.userId}
 - **Chat**: ${session.chatId}
+${session.requestId ? `- **Request ID**: ${session.requestId}\n` : ""}
 
 ## Session Summary
 
@@ -250,10 +362,15 @@ ${session.fullContext}
    * Call this method after writing new memory files to make them searchable.
    */
   async reindexMemory(): Promise<boolean> {
-    return new Promise((resolve) => {
-      console.log("[MemoryBridge] 🔄 Re-indexing OpenClaw memory...");
+    const available = await checkOpenClawAvailable();
+    if (!available) {
+      return false;
+    }
 
-      const proc = spawn("openclaw", ["memory", "index", "--force"], {
+    try {
+      console.log(`${LOG_PREFIX} Re-indexing OpenClaw memory...`);
+
+      const proc = await spawnWithRetry("openclaw", ["memory", "index", "--force"], {
         stdio: "ignore",
         detached: true,
       });
@@ -261,24 +378,13 @@ ${session.fullContext}
       // Don't wait for completion - fire and forget
       proc.unref();
 
-      proc.on("error", (err) => {
-        console.error(`[MemoryBridge] ❌ Reindex failed: ${err.message}`);
-        resolve(false);
-      });
-
-      proc.on("spawn", () => {
-        console.log("[MemoryBridge] ✅ Memory reindex started in background");
-        resolve(true);
-      });
-
-      // Timeout after 5 seconds
-      setTimeout(() => {
-        if (proc.exitCode === null) {
-          console.warn("[MemoryBridge] ⏰ Reindex timeout (continuing in background)");
-          resolve(true);
-        }
-      }, 5000);
-    });
+      console.log(`${LOG_PREFIX} Memory reindex started in background`);
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`${LOG_PREFIX} Reindex failed: ${msg}`);
+      return false;
+    }
   }
 
   /**
@@ -288,13 +394,18 @@ ${session.fullContext}
    * Used to enable immediate agent awareness.
    */
   async notifyAgent(memoryFile: string, insights: string[]): Promise<boolean> {
-    return new Promise((resolve) => {
+    const available = await checkOpenClawAvailable();
+    if (!available) {
+      return false;
+    }
+
+    try {
       const insightText = insights.slice(0, 3).join("; ");
-      const message = `🧠 [Memory Update] New session saved to ${memoryFile}\n\n🔑 Key insights: ${insightText}`;
+      const message = `[Memory Update] New session saved to ${memoryFile}\n\nKey insights: ${insightText}`;
 
-      console.log("[MemoryBridge] 📢 Notifying OpenClaw agent...");
+      console.log(`${LOG_PREFIX} Notifying OpenClaw agent...`);
 
-      const proc = spawn("openclaw", ["agent", "--message", message], {
+      const proc = await spawnWithRetry("openclaw", ["agent", "--message", message], {
         stdio: "ignore",
         detached: true,
       });
@@ -302,24 +413,13 @@ ${session.fullContext}
       // Don't wait for completion
       proc.unref();
 
-      proc.on("error", (err) => {
-        console.error(`[MemoryBridge] ❌ Agent notification failed: ${err.message}`);
-        resolve(false);
-      });
-
-      proc.on("spawn", () => {
-        console.log("[MemoryBridge] ✅ Agent notification sent");
-        resolve(true);
-      });
-
-      // Timeout after 5 seconds
-      setTimeout(() => {
-        if (proc.exitCode === null) {
-          console.warn("[MemoryBridge] ⏰ Agent notification timeout");
-          resolve(false);
-        }
-      }, 5000);
-    });
+      console.log(`${LOG_PREFIX} Agent notification sent`);
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`${LOG_PREFIX} Agent notification failed: ${msg}`);
+      return false;
+    }
   }
 
   /**
@@ -332,7 +432,9 @@ ${session.fullContext}
     userId: string;
     chatId: string;
     prompt: string;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     streamEvents: any[];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     result: any;
     startTime: number;
     endTime: number;
@@ -442,7 +544,9 @@ export function extractExecutionDetails(events: StreamEventData[]): {
     if (event.type === "tool_use") {
       const data = event.data as { toolName?: string; input?: string | Record<string, unknown> };
 
-      if (!data?.toolName) continue;
+      if (!data?.toolName) {
+        continue;
+      }
 
       const toolName = data.toolName;
       toolsUsed.add(toolName);
@@ -456,10 +560,12 @@ export function extractExecutionDetails(events: StreamEventData[]): {
           // Not JSON, skip parsing
         }
       } else if (typeof data.input === "object" && data.input !== null) {
-        toolInput = data.input as Record<string, unknown>;
+        toolInput = data.input;
       }
 
-      if (!toolInput) continue;
+      if (!toolInput) {
+        continue;
+      }
 
       // Extract file paths based on tool type
       switch (toolName) {
@@ -548,9 +654,13 @@ export function extractExecutionDetails(events: StreamEventData[]): {
  * @returns Result with file path if successful
  */
 export async function writeSessionToMemory(session: ClaudeCodeSession): Promise<MemoryWriteResult> {
+  if (isBridgeDisabledByEnv()) {
+    return { success: false, error: "Bridge disabled via FEISHU_MEMORY_BRIDGE_ENABLED" };
+  }
+
   const bridge = getMemoryBridge();
   if (!bridge.isEnabled()) {
-    console.log("[MemoryBridge] Skipping - bridge not enabled");
+    console.log(`${LOG_PREFIX} Skipping - bridge not enabled`);
     return { success: false, error: "Bridge not enabled" };
   }
 

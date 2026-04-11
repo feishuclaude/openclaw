@@ -11,7 +11,6 @@ import type {
   PermissionCallback,
   ExecutionResult,
   ExecutionOptions,
-  StreamEventHandler,
   ToolType,
   QuestionCallback,
 } from "./types.js";
@@ -41,6 +40,7 @@ export class HappyClawSDK {
    */
   private onAskUserQuestion: QuestionCallback | undefined;
   private sdkAvailable: boolean = false;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private agentSdk: any = null;
   private currentAbortController: AbortController | null = null;
 
@@ -67,7 +67,7 @@ export class HappyClawSDK {
       this.agentSdk = require("@anthropic-ai/claude-agent-sdk");
       this.sdkAvailable = true;
       console.log("[HappyClawSDK] Claude Agent SDK loaded successfully");
-    } catch (error) {
+    } catch {
       this.sdkAvailable = false;
       console.log("[HappyClawSDK] Claude Agent SDK not available, will use CLI fallback");
     }
@@ -82,10 +82,18 @@ export class HappyClawSDK {
     const commands = ["bash", "command", "run_command"];
     const web = ["web_search", "read_website"];
 
-    if (fileRead.includes(toolName)) return "file_read";
-    if (fileWrite.includes(toolName)) return "file_write";
-    if (commands.includes(toolName)) return "command";
-    if (web.includes(toolName)) return "web_search";
+    if (fileRead.includes(toolName)) {
+      return "file_read";
+    }
+    if (fileWrite.includes(toolName)) {
+      return "file_write";
+    }
+    if (commands.includes(toolName)) {
+      return "command";
+    }
+    if (web.includes(toolName)) {
+      return "web_search";
+    }
     return "unknown";
   }
 
@@ -93,7 +101,9 @@ export class HappyClawSDK {
    * Execute command
    */
   async execute(prompt: string, options?: ExecutionOptions): Promise<ExecutionResult> {
-    console.log(`[HappyClawSDK] Executing: "${prompt.substring(0, 100)}..."`);
+    const rid = options?.requestId;
+    const tag = rid ? `[feishu:sdk:${rid}]` : "[HappyClawSDK]";
+    console.log(`${tag} Executing: "${prompt.substring(0, 100)}..."`);
 
     if (!existsSync(this.workingDirectory)) {
       this.workingDirectory = this.workingDirectory || "/tmp/happy-claw-sdk";
@@ -106,18 +116,18 @@ export class HappyClawSDK {
 
     // Use streaming if all conditions met
     if (this.sdkAvailable && effectiveOnPermission && effectiveOnStreamEvent) {
-      console.log("[HappyClawSDK] Using streaming with permission handling");
+      console.log(`${tag} Using streaming with permission handling`);
       return this.executeStream(prompt, options);
     }
 
     // Otherwise use non-streaming SDK if available
     if (this.sdkAvailable && effectiveOnPermission) {
-      console.log("[HappyClawSDK] Using Agent SDK with permission handling");
+      console.log(`${tag} Using Agent SDK with permission handling`);
       return this.executeWithSDK(prompt, options);
     }
 
     // Fallback to CLI
-    console.log("[HappyClawSDK] Using CLI (no permission handling)");
+    console.log(`${tag} Using CLI (no permission handling)`);
     return this.executeWithCLI(prompt);
   }
 
@@ -127,11 +137,13 @@ export class HappyClawSDK {
    * @returns Execution result
    */
   async executeStream(prompt: string, options?: ExecutionOptions): Promise<ExecutionResult> {
-    console.log(`[HappyClawSDK] Executing stream: "${prompt.substring(0, 100)}..."`);
+    const rid = options?.requestId;
+    const tag = rid ? `[feishu:sdk:${rid}]` : "[HappyClawSDK]";
+    console.log(`${tag} Executing stream: "${prompt.substring(0, 100)}..."`);
 
     // Ensure working directory exists
     if (!existsSync(this.workingDirectory)) {
-      console.log(`[HappyClawSDK] Creating working directory: ${this.workingDirectory}`);
+      console.log(`${tag} Creating working directory: ${this.workingDirectory}`);
       spawn("mkdir", ["-p", this.workingDirectory]);
     }
 
@@ -141,7 +153,7 @@ export class HappyClawSDK {
 
     // Fall back to non-streaming if SDK unavailable or no callbacks
     if (!this.sdkAvailable || !effectiveOnStreamEvent || !effectiveOnPermission) {
-      console.log("[HappyClawSDK] Falling back to non-streaming execute");
+      console.log(`${tag} Falling back to non-streaming execute`);
       return this.execute(prompt, options);
     }
 
@@ -277,15 +289,17 @@ export class HappyClawSDK {
     // Resolve effective callbacks before try block so they're available in catch
     const effectiveOnStreamEvent = options?.onStreamEvent ?? this.onStreamEvent;
     const effectiveOnAskUserQuestion = options?.onAskUserQuestion ?? this.onAskUserQuestion;
+    const rid = options?.requestId;
+    const tag = rid ? `[feishu:sdk:${rid}]` : "[HappyClawSDK]";
 
     let capturedSessionId: string | undefined;
     try {
       const { query } = this.agentSdk;
       this.currentAbortController = new AbortController();
 
-      console.log("[HappyClawSDK] Starting SDK streaming execution...");
+      console.log(`${tag} Starting SDK streaming execution...`);
       if (options?.claudeSessionId) {
-        console.log(`[HappyClawSDK] Resuming Claude session: ${options.claudeSessionId}`);
+        console.log(`${tag} Resuming Claude session: ${options.claudeSessionId}`);
       }
 
       // Resolve effective callbacks (per-execution overrides take precedence)
@@ -310,6 +324,7 @@ export class HappyClawSDK {
       queryOptions.canUseTool = async (
         toolName: string,
         input: Record<string, unknown>,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         opts: any,
       ) => {
         console.log(`[DEBUG-SDK] ========== CAN USE TOOL CALLED ==========`);
@@ -391,7 +406,7 @@ export class HappyClawSDK {
             console.error(`[DEBUG-SDK] Question handling error:`, error);
             return {
               behavior: "deny" as const,
-              message: `Question handling failed: ${error}`,
+              message: `Question handling failed: ${error instanceof Error ? error.message : String(error)}`,
             };
           }
         }
@@ -444,8 +459,8 @@ export class HappyClawSDK {
         options: queryOptions,
       })) {
         // Capture session_id from any message (all types include it)
-        if (!capturedSessionId && (message as any).session_id) {
-          capturedSessionId = (message as any).session_id;
+        if (!capturedSessionId && message.session_id) {
+          capturedSessionId = message.session_id;
         }
 
         // Handle different message types
@@ -488,6 +503,7 @@ export class HappyClawSDK {
                 });
               }
             },
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             onAskUserQuestion: (questions: any) => {
               if (effectiveOnStreamEvent) {
                 effectiveOnStreamEvent({
@@ -500,8 +516,8 @@ export class HappyClawSDK {
           });
         } else if (message.type === "result") {
           // Final result -- also capture session_id from result
-          if ((message as any).session_id) {
-            capturedSessionId = capturedSessionId || (message as any).session_id;
+          if (message.session_id) {
+            capturedSessionId = capturedSessionId || message.session_id;
           }
           if (message.result) {
             fullOutput = message.result || fullOutput;
@@ -509,9 +525,9 @@ export class HappyClawSDK {
         }
       }
 
-      console.log("[HappyClawSDK] SDK streaming completed");
+      console.log(`${tag} SDK streaming completed`);
       if (capturedSessionId) {
-        console.log(`[HappyClawSDK] Claude session ID: ${capturedSessionId}`);
+        console.log(`${tag} Claude session ID: ${capturedSessionId}`);
       }
 
       // Emit final status event
@@ -533,7 +549,7 @@ export class HappyClawSDK {
       const errorMsg = error instanceof Error ? error.message : String(error);
 
       if (errorMsg.includes("aborted") || errorMsg.includes("AbortError")) {
-        console.log(`[HappyClawSDK] Execution aborted`);
+        console.log(`${tag} Execution aborted`);
 
         // Emit error status event
         if (effectiveOnStreamEvent) {
@@ -552,7 +568,7 @@ export class HappyClawSDK {
         };
       }
 
-      console.error(`[HappyClawSDK] SDK streaming failed: ${errorMsg}`);
+      console.error(`${tag} SDK streaming failed: ${errorMsg}`);
 
       // Emit error status event
       if (effectiveOnStreamEvent) {
@@ -587,16 +603,20 @@ export class HappyClawSDK {
    * Handle raw stream event from SDK
    */
   private handleStreamEvent(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     event: any,
     handlers: {
       onTextDelta: (text: string) => void;
       onToolUse: (tool: string, input: string) => void;
       onToolResult: (result: string, exitCode: number) => void;
       onThinking: (content: string) => void;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       onAskUserQuestion?: (questions: any) => void;
     },
   ): void {
-    if (!event) return;
+    if (!event) {
+      return;
+    }
 
     switch (event.type) {
       case "content_block_start":
@@ -657,7 +677,9 @@ export class HappyClawSDK {
                 if (typeof block.content === "string") {
                   output = block.content;
                 } else if (Array.isArray(block.content)) {
-                  output = block.content.map((c: any) => c.text || "").join("\n");
+                  output = block.content
+                    .map((c: unknown) => (c as { text?: string }).text || "")
+                    .join("\n");
                 } else {
                   output = JSON.stringify(block.content || "");
                 }
@@ -701,7 +723,7 @@ export class HappyClawSDK {
         });
       }, this.timeout);
 
-      (async () => {
+      void (async () => {
         try {
           // Write prompt to temporary file
           const promptFile = join(this.workingDirectory, `prompt-${Date.now()}.txt`);

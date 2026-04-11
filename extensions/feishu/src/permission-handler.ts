@@ -20,7 +20,9 @@ const pendingPermissions = new Map<
   }
 >();
 
-// Chat-scoped reverse lookup: chatId -> most recent pending permissionId
+// User-scoped reverse lookup: `${chatId}:${senderOpenId}` -> most recent pending permissionId.
+// Composite key prevents privilege escalation in group chats where any user's
+// /approve could previously resolve another user's pending permission.
 const pendingPermissionByChat = new Map<string, string>();
 
 // Approve-all state: when enabled, all future permission requests auto-approve
@@ -137,10 +139,14 @@ export async function waitForPermissionResponse(
   permissionId: string,
   timeout: number,
   chatId?: string,
+  senderOpenId?: string,
 ): Promise<PermissionResult> {
-  // Track the latest pending permission for this chat (enables /approve and /deny)
-  if (chatId) {
-    pendingPermissionByChat.set(chatId, permissionId);
+  // Track the latest pending permission scoped to chat + sender (enables /approve and /deny).
+  // The composite key ensures that in group chats only the original requester can
+  // approve/deny their own pending permission.
+  const compositeKey = chatId && senderOpenId ? `${chatId}:${senderOpenId}` : chatId;
+  if (compositeKey) {
+    pendingPermissionByChat.set(compositeKey, permissionId);
   }
 
   return new Promise((resolve) => {
@@ -156,9 +162,9 @@ export async function waitForPermissionResponse(
     function cleanup() {
       clearTimeout(timer);
       pendingPermissions.delete(permissionId);
-      // Only remove the chat mapping if it still points to this permission
-      if (chatId && pendingPermissionByChat.get(chatId) === permissionId) {
-        pendingPermissionByChat.delete(chatId);
+      // Only remove the chat+sender mapping if it still points to this permission
+      if (compositeKey && pendingPermissionByChat.get(compositeKey) === permissionId) {
+        pendingPermissionByChat.delete(compositeKey);
       }
     }
 
@@ -174,16 +180,23 @@ export async function waitForPermissionResponse(
 }
 
 /**
- * Get the most recent pending permission ID for a chat.
+ * Get the most recent pending permission ID for a chat + sender.
  * Used by /approve and /deny text commands to resolve the correct permission.
+ * The composite key ensures group chat users can only resolve their own requests.
  * @returns The pending permissionId, or null if none exists
  */
-export function resolveLatestPendingPermission(chatId: string): string | null {
-  const permissionId = pendingPermissionByChat.get(chatId);
-  if (!permissionId) return null;
+export function resolveLatestPendingPermission(
+  chatId: string,
+  senderOpenId: string,
+): string | null {
+  const compositeKey = `${chatId}:${senderOpenId}`;
+  const permissionId = pendingPermissionByChat.get(compositeKey);
+  if (!permissionId) {
+    return null;
+  }
   // Verify the permission is still pending
   if (!pendingPermissions.has(permissionId)) {
-    pendingPermissionByChat.delete(chatId);
+    pendingPermissionByChat.delete(compositeKey);
     return null;
   }
   return permissionId;

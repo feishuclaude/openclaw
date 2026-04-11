@@ -119,6 +119,8 @@ export interface ExecutionOptions {
   onStreamEvent?: StreamEventHandler;
   /** Per-execution question callback override. Takes precedence over SDK-level callback. */
   onAskUserQuestion?: QuestionCallback;
+  /** Correlation ID for cross-layer request tracing. */
+  requestId?: string;
 }
 
 /**

@@ -10,12 +10,9 @@ import type { StreamEvent } from "./sdk/types.js";
 import { sendCardFeishu, updateCardFeishu } from "./send.js";
 import type {
   CardSession,
-  CardState,
-  ToolCall,
   PendingQuestion,
   PendingQuestionEntry,
   QuestionAnswer,
-  SequentialQuestionState,
 } from "./streaming-card-types.js";
 
 /** Debounce delay to avoid Feishu API rate limits (same as metabot) */
@@ -88,7 +85,7 @@ export function resolveQuestion(questionId: string, result: QuestionAnswer): boo
 
     // Store the answer - map questionIndex 0 to the current sequential index
     if (result.answered && result.answers) {
-      for (const [idx, answer] of result.answers) {
+      for (const [_idx, answer] of result.answers) {
         // In sequential mode, idx is always 0 (single question displayed)
         // Map it to the actual question index in the original array
         const actualIndex = seqState.currentIndex;
@@ -195,7 +192,9 @@ function getCardSession(chatId: string): CardSession | undefined {
  */
 async function updateCardSession(chatId: string): Promise<void> {
   const session = cardSessions.get(chatId);
-  if (!session?.messageId) return;
+  if (!session?.messageId) {
+    return;
+  }
 
   try {
     const cardJson = buildCard(session.state);
@@ -269,11 +268,14 @@ export class StreamingCardManager {
   private sessions = new Map<string, CardSession>();
   private updateQueue = new Map<string, NodeJS.Timeout>();
   private cleanupTimer: NodeJS.Timeout;
+  private requestId: string | undefined;
 
   constructor(
     private cfg: ClawdbotConfig,
     private accountId?: string,
+    requestId?: string,
   ) {
+    this.requestId = requestId;
     // Set static references for helper functions
     cardSessions = this.sessions;
     cardConfig = this.cfg;
@@ -292,7 +294,12 @@ export class StreamingCardManager {
    * Start a new streaming session for a chat
    * @returns The initial card message ID
    */
-  async startSession(chatId: string): Promise<string> {
+  async startSession(chatId: string, requestId?: string): Promise<string> {
+    if (requestId) {
+      this.requestId = requestId;
+    }
+    const tag = this.requestId ? `[feishu:stream:${this.requestId}] ` : "";
+    console.log(`${tag}Starting session for chat ${chatId}`);
     const session: CardSession = {
       chatId,
       state: {
@@ -322,8 +329,12 @@ export class StreamingCardManager {
    * Handle a stream event from happy-claw-sdk
    */
   handleEvent(chatId: string, event: StreamEvent): void {
+    const tag = this.requestId ? `[feishu:stream:${this.requestId}] ` : "";
     const session = this.sessions.get(chatId);
-    if (!session) return;
+    if (!session) {
+      console.warn(`${tag}handleEvent called for unknown chat ${chatId}`);
+      return;
+    }
 
     switch (event.type) {
       case "text_delta": {
@@ -348,7 +359,9 @@ export class StreamingCardManager {
           session.state.answerSummary = undefined;
         }
         const data = event.data as Record<string, unknown> | undefined;
-        const toolName = String(data?.toolName ?? data?.name ?? "unknown");
+        const toolName = String(
+          (data?.toolName as string | undefined) ?? (data?.name as string | undefined) ?? "unknown",
+        );
 
         // Skip AskUserQuestion - it's handled separately as a question UI
         if (toolName === "AskUserQuestion") {
@@ -369,7 +382,7 @@ export class StreamingCardManager {
             // input is an object, stringify it
             str = JSON.stringify(rawInput);
           } else {
-            str = String(rawInput);
+            str = JSON.stringify(rawInput);
           }
           // Don't show empty objects/strings as detail
           if (str !== "{}" && str !== "" && str !== "null" && str !== "undefined") {
@@ -402,7 +415,7 @@ export class StreamingCardManager {
       case "tool_result": {
         // Mark the last running tool as success
         const lastRunning = [...session.state.toolCalls]
-          .reverse()
+          .toReversed()
           .find((t) => t.status === "running");
         if (lastRunning) {
           lastRunning.status = "success";
@@ -539,7 +552,9 @@ export class StreamingCardManager {
    */
   private async updateCard(chatId: string): Promise<void> {
     const session = this.sessions.get(chatId);
-    if (!session?.messageId) return;
+    if (!session?.messageId) {
+      return;
+    }
 
     try {
       const cardJson = buildCard(session.state);
@@ -561,8 +576,12 @@ export class StreamingCardManager {
    * End a session with final update
    */
   async endSession(chatId: string): Promise<void> {
+    const tag = this.requestId ? `[feishu:stream:${this.requestId}] ` : "";
+    console.log(`${tag}Ending session for chat ${chatId}`);
     const session = this.sessions.get(chatId);
-    if (!session) return;
+    if (!session) {
+      return;
+    }
 
     // Cancel any pending update
     const pending = this.updateQueue.get(chatId);
@@ -587,7 +606,7 @@ export class StreamingCardManager {
     const now = Date.now();
     for (const [chatId, session] of this.sessions) {
       if (now - session.startTime > SESSION_TIMEOUT_MS) {
-        this.endSession(chatId);
+        void this.endSession(chatId);
       }
     }
   }
@@ -601,7 +620,7 @@ export class StreamingCardManager {
     }
     // End all sessions
     for (const chatId of this.sessions.keys()) {
-      this.endSession(chatId);
+      void this.endSession(chatId);
     }
   }
 }

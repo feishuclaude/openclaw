@@ -47,7 +47,7 @@ import {
   clearCachedSession,
 } from "./claude-code-executor.js";
 import { createFeishuClient } from "./client.js";
-import { resolveCommand, getCommandUsageHelp } from "./command-registry.js";
+import { resolveCommand } from "./command-registry.js";
 import { finalizeFeishuMessageProcessing, tryRecordMessagePersistent } from "./dedup.js";
 import { maybeCreateDynamicAgent } from "./dynamic-agent.js";
 import { extractMentionTargets, isMentionForwardRequest } from "./mention.js";
@@ -449,7 +449,7 @@ async function handleResetCommand(ctx: CommandHandlerContext): Promise<void> {
 async function handleBuiltinCommand(
   ctx: CommandHandlerContext,
   command: string,
-  args: string,
+  _args: string,
 ): Promise<boolean> {
   switch (command) {
     case "/help":
@@ -478,12 +478,13 @@ async function handlePermissionCommand(params: {
   cfg: ClawdbotConfig;
   account: ResolvedFeishuAccount;
   chatId: string;
+  senderOpenId: string;
   command: string;
   log: (...args: unknown[]) => void;
 }): Promise<void> {
-  const { cfg, account, chatId, command, log } = params;
+  const { cfg, account, chatId, senderOpenId, command, log } = params;
   const action = command === "/approve" ? "approve" : "deny";
-  const permId = resolveLatestPendingPermission(chatId);
+  const permId = resolveLatestPendingPermission(chatId, senderOpenId);
 
   if (!permId) {
     await sendMessageFeishu({
@@ -801,6 +802,7 @@ export async function handleFeishuMessage(params: {
         cfg,
         account,
         chatId: ctx.chatId,
+        senderOpenId: ctx.senderOpenId,
         command,
         log,
       });
@@ -852,6 +854,7 @@ export async function handleFeishuMessage(params: {
           cfg,
           account,
           chatId: ctx.chatId,
+          senderOpenId: ctx.senderOpenId,
           prompt: args,
           mode: { kind: "skill", skillId: resolved.skill, commandName: resolved.name },
           log,
@@ -872,6 +875,7 @@ export async function handleFeishuMessage(params: {
         cfg,
         account,
         chatId: ctx.chatId,
+        senderOpenId: ctx.senderOpenId,
         prompt,
         mode: { kind: "happy" },
         options: { newSession, resetApproveAll },
@@ -894,6 +898,7 @@ export async function handleFeishuMessage(params: {
         cfg,
         account,
         chatId: ctx.chatId,
+        senderOpenId: ctx.senderOpenId,
         prompt: trimmed,
         mode: { kind: "happy" },
         log,

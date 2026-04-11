@@ -8,7 +8,9 @@
  * execution mode (happy vs. skill).
  */
 
+import path from "node:path";
 import type { ClawdbotConfig } from "./bot-runtime-api.js";
+import { isClaudeSDKAvailable } from "./claude-code-preflight.js";
 import { buildSkillPrompt } from "./command-registry.js";
 import {
   writeSessionToMemory,
@@ -40,12 +42,30 @@ const PERMISSION_TIMEOUT_MS = 120_000;
 const DEFAULT_HAPPY_WORKING_DIR = "/tmp/happy_feishu";
 const SESSION_CACHE_TTL_MS = 3_600_000; // 1 hour
 
+// --- Allowed working directory roots ---
+const ALLOWED_ROOTS: readonly string[] = [
+  process.env.OPENCLAW_MEMORY_DIR || "/root/.openclaw/workspace/memory",
+  process.env.OPENCLAW_WORKSPACE_DIR || process.cwd(),
+  DEFAULT_HAPPY_WORKING_DIR,
+];
+
+/** Returns true when `dir` resolves to a path within one of the allowed roots. */
+export function isWithinAllowedRoot(dir: string): boolean {
+  const resolved = path.resolve(path.normalize(dir));
+  return ALLOWED_ROOTS.some((root) => {
+    const resolvedRoot = path.resolve(path.normalize(root));
+    return resolved === resolvedRoot || resolved.startsWith(resolvedRoot + path.sep);
+  });
+}
+
 // --- Session cache (per-chatId Claude session for multi-turn conversations) ---
 const cachedClaudeSession = new Map<string, { sessionId: string; expiresAt: number }>();
 
 export function getCachedSessionId(chatId: string): string | undefined {
   const entry = cachedClaudeSession.get(chatId);
-  if (!entry) return undefined;
+  if (!entry) {
+    return undefined;
+  }
   if (Date.now() > entry.expiresAt) {
     cachedClaudeSession.delete(chatId);
     return undefined;
@@ -81,6 +101,7 @@ export interface ClaudeCodeExecutionParams {
   cfg: ClawdbotConfig;
   account: ResolvedFeishuAccount;
   chatId: string;
+  senderOpenId: string;
   prompt: string;
   mode: ExecutionMode;
   options?: {
@@ -95,12 +116,32 @@ export interface ClaudeCodeExecutionParams {
  * Handles both /happy and skill command execution with shared SDK setup,
  * permission handling, streaming, and memory bridge.
  */
+/** Generate a short request ID for cross-layer tracing. */
+function generateRequestId(): string {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
 export async function executeClaudeCode(params: ClaudeCodeExecutionParams): Promise<void> {
-  const { cfg, account, chatId, prompt, mode, options, log } = params;
+  const { cfg, account, chatId, senderOpenId, prompt, mode, options, log } = params;
   const label = mode.kind === "skill" ? `/${mode.commandName}` : "/happy";
+  const requestId = generateRequestId();
+  const rlog = (...args: unknown[]) => log(`[feishu:exec:${requestId}]`, ...args);
+
+  // --- SDK availability gate ---
+  if (!isClaudeSDKAvailable()) {
+    rlog(`SDK not available for ${label}`);
+    await sendMessageFeishu({
+      cfg,
+      to: `chat:${chatId}`,
+      text: `[${label}] Claude Code is not available. Please install @anthropic-ai/claude-agent-sdk to use this feature.`,
+      accountId: account.accountId,
+    });
+    return;
+  }
 
   // --- Concurrency guard ---
   if (activeExecution) {
+    rlog(`Rejected — another execution is active`);
     await sendMessageFeishu({
       cfg,
       to: `chat:${chatId}`,
@@ -113,7 +154,7 @@ export async function executeClaudeCode(params: ClaudeCodeExecutionParams): Prom
   // --- Reset approve-all if requested ---
   if (options?.resetApproveAll) {
     setApproveAllEnabled(false);
-    log(`feishu[${account.accountId}]: ${label} approve-all reset`);
+    rlog(`approve-all reset`);
     if (!prompt) {
       await sendMessageFeishu({
         cfg,
@@ -128,7 +169,7 @@ export async function executeClaudeCode(params: ClaudeCodeExecutionParams): Prom
   // --- New session if requested ---
   if (options?.newSession) {
     cachedClaudeSession.delete(chatId);
-    log(`feishu[${account.accountId}]: ${label} new session requested`);
+    rlog(`new session requested`);
   }
 
   // --- Validate prompt ---
@@ -144,10 +185,28 @@ export async function executeClaudeCode(params: ClaudeCodeExecutionParams): Prom
 
   activeExecution = true;
 
-  const cardManager = new StreamingCardManager(cfg, account.accountId);
   const feishuCfg = account.config as Record<string, unknown> | undefined;
   const workingDirectory =
     (feishuCfg?.happyWorkingDirectory as string) || DEFAULT_HAPPY_WORKING_DIR;
+
+  // --- Working directory validation ---
+  if (!isWithinAllowedRoot(workingDirectory)) {
+    console.warn(
+      `[feishu:exec:${requestId}] Rejected working directory outside allowed roots:`,
+      workingDirectory,
+    );
+    activeExecution = false;
+    await sendMessageFeishu({
+      cfg,
+      to: `chat:${chatId}`,
+      text: `[${label}] Error: The configured working directory is outside the allowed roots. Execution aborted.`,
+      accountId: account.accountId,
+    });
+    return;
+  }
+
+  const cardManager = new StreamingCardManager(cfg, account.accountId, requestId);
+
   const streamEvents: StreamEventData[] = [];
 
   // Build mode-specific session metadata
@@ -177,12 +236,12 @@ export async function executeClaudeCode(params: ClaudeCodeExecutionParams): Prom
   };
 
   try {
-    await cardManager.startSession(chatId);
+    await cardManager.startSession(chatId, requestId);
 
     // --- Permission callback ---
     const onPermission = async (request: PermissionRequest): Promise<PermissionResult> => {
       if (isApproveAllEnabled()) {
-        log(`feishu[${account.accountId}]: ${label} auto-approved tool: ${request.toolName}`);
+        rlog(`auto-approved tool: ${request.toolName}`);
         return { approved: true };
       }
       await sendPermissionCard({
@@ -192,7 +251,12 @@ export async function executeClaudeCode(params: ClaudeCodeExecutionParams): Prom
         toolName: request.toolName,
         toolInput: request.toolInput,
       });
-      return waitForPermissionResponse(request.permissionId, PERMISSION_TIMEOUT_MS, chatId);
+      return waitForPermissionResponse(
+        request.permissionId,
+        PERMISSION_TIMEOUT_MS,
+        chatId,
+        senderOpenId,
+      );
     };
 
     // --- Stream event handler ---
@@ -207,24 +271,22 @@ export async function executeClaudeCode(params: ClaudeCodeExecutionParams): Prom
 
     // --- Question callback ---
     const onAskUserQuestion = async (request: QuestionRequest): Promise<QuestionResult> => {
-      log(
-        `feishu[${account.accountId}]: ${label} AskUserQuestion called with ${request.questions.length} question(s)`,
-      );
+      rlog(`AskUserQuestion called with ${request.questions.length} question(s)`);
       const { questionId, answerPromise } = await sendQuestionCard(
         { questionId: "pending", questions: request.questions },
         PERMISSION_TIMEOUT_MS,
         chatId,
       );
-      log(`feishu[${account.accountId}]: ${label} waiting for question answer (ID: ${questionId})`);
+      rlog(`waiting for question answer (ID: ${questionId})`);
       const answer = await answerPromise;
-      log(`feishu[${account.accountId}]: ${label} question answered: ${answer.answered}`);
+      rlog(`question answered: ${answer.answered}`);
       return answer;
     };
 
     // --- Session resume ---
     const claudeSessionId = getCachedSessionId(chatId);
     if (claudeSessionId) {
-      log(`feishu[${account.accountId}]: ${label} resuming session ${claudeSessionId}`);
+      rlog(`resuming session ${claudeSessionId}`);
     }
 
     // --- Build prompt ---
@@ -244,14 +306,14 @@ export async function executeClaudeCode(params: ClaudeCodeExecutionParams): Prom
       onStreamEvent,
       onAskUserQuestion,
     });
-    const result = await sdk.execute(constrainedPrompt, { claudeSessionId });
+    const result = await sdk.execute(constrainedPrompt, { claudeSessionId, requestId });
 
     if (result.claudeSessionId) {
       setCachedSessionId(chatId, result.claudeSessionId);
     }
 
     await cardManager.endSession(chatId);
-    log(`feishu[${account.accountId}]: ${label} command completed (success=${result.success})`);
+    rlog(`command completed (success=${result.success})`);
 
     // --- Build execution details for memory ---
     const executionDetails = extractExecutionDetails(streamEvents);
@@ -291,9 +353,10 @@ export async function executeClaudeCode(params: ClaudeCodeExecutionParams): Prom
       insights,
       fullContext,
       error: result.error,
+      requestId,
     };
   } catch (err) {
-    log(`feishu[${account.accountId}]: ${label} command failed: ${String(err)}`);
+    rlog(`command failed: ${String(err)}`);
 
     sessionData = {
       ...sessionData,
@@ -301,9 +364,10 @@ export async function executeClaudeCode(params: ClaudeCodeExecutionParams): Prom
       insights: [...initialInsights, "Command failed with error"],
       fullContext: `${initialContext}\n\nError: ${String(err)}`,
       error: String(err),
+      requestId,
     };
 
-    const errorManager = new StreamingCardManager(cfg, account.accountId);
+    const errorManager = new StreamingCardManager(cfg, account.accountId, requestId);
     try {
       await errorManager.startSession(chatId);
       errorManager.handleEvent(chatId, {
@@ -324,7 +388,7 @@ export async function executeClaudeCode(params: ClaudeCodeExecutionParams): Prom
     }
   } finally {
     writeSessionToMemory(sessionData).catch((memErr) => {
-      console.error(`[MemoryBridge] Failed to write session: ${memErr}`);
+      console.error(`[feishu:exec:${requestId}] Failed to write session: ${memErr}`);
     });
     cardManager.destroy();
     activeExecution = false;

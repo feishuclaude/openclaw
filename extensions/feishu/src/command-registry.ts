@@ -101,7 +101,20 @@ export function registerSkill(
 
   // Prevent duplicate registrations
   if (commandsByName.has(name)) {
+    console.debug(
+      `[feishu:command-registry] Skipping duplicate registration: command "${name}" (skill: ${skillId}) already registered`,
+    );
     return;
+  }
+
+  // Log alias collisions when deriveAlias returned a suffixed variant
+  if (!opts?.alias) {
+    const baseAlias = name.charAt(0).toLowerCase();
+    if (alias !== baseAlias) {
+      console.debug(
+        `[feishu:command-registry] Alias collision for "${baseAlias}", using "${alias}" instead (skill: ${skillId})`,
+      );
+    }
   }
 
   const definition: CommandDefinition = {
@@ -138,7 +151,7 @@ export function isRegisteredCommand(input: string): boolean {
  * Get all registered commands, sorted by name for deterministic output.
  */
 export function getAllCommands(): CommandDefinition[] {
-  return Array.from(commandsByName.values()).sort((a, b) => a.name.localeCompare(b.name));
+  return Array.from(commandsByName.values()).toSorted((a, b) => a.name.localeCompare(b.name));
 }
 
 /**
